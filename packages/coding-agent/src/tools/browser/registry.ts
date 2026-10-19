@@ -16,7 +16,7 @@ import {
 	removeUserDataDir,
 	type UserAgentOverride,
 } from "./launch";
-import { reapOrphanSharedTargets } from "./orphan-registry";
+import { reapOrphanSharedTargets, retryUnclosedSharedTargets, type SharedTargetScope } from "./orphan-registry";
 import { ensureRelayDaemon, isLoopbackRelayUrl, restartRelayDaemon } from "./relay/daemon";
 import type { RelayKind } from "./relay/kind";
 import { waitForRelayExtension } from "./relay/probe";
@@ -81,6 +81,17 @@ export interface TernBrowserHandle extends BrowserHandleCommon {
 }
 
 export type BrowserHandle = PuppeteerBrowserHandle | CmuxBrowserHandle | TernBrowserHandle;
+
+/**
+ * Durable-ownership scope for a browser handle, or undefined when the handle is
+ * not the project-shared broker-owned Chromium (the only browser whose targets
+ * outlive their creating process and thus need cross-process orphan reaping).
+ */
+export function sharedTargetScopeOf(handle: BrowserHandle): SharedTargetScope | undefined {
+	if (!("browser" in handle)) return undefined;
+	if (handle.kind.kind !== "headless" || !handle.sharedDaemon) return undefined;
+	return { projectDir: handle.sharedDaemon.projectDir, daemonName: handle.sharedDaemon.name };
+}
 
 /** Controls bounded browser-handle teardown and identifies the owning resource in timeout diagnostics. */
 export interface ReleaseBrowserOptions {
@@ -514,12 +525,7 @@ async function openSharedHeadlessHandle(
 				: null,
 			protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 		});
-		// Attaching to the shared daemon is the natural point to sweep targets
-		// left behind by omp processes that died without teardown — bounds
-		// accumulation without a background timer. Best-effort and detached so a
-		// slow reap never delays the open (issue #10022).
-		void reapOrphanSharedTargets(browser, { projectDir: shared.projectDir, daemonName: shared.daemonName });
-		return {
+		const handle: PuppeteerBrowserHandle = {
 			key: browserKey(kind),
 			kind,
 			browser,
@@ -527,6 +533,18 @@ async function openSharedHeadlessHandle(
 			refCount: 0,
 			stealth: { browserSession: null, override: null },
 		};
+		const scope = sharedTargetScopeOf(handle);
+		if (scope) {
+			// Attaching to the shared daemon is the natural point to sweep targets
+			// left behind by omp processes that died without teardown — bounds
+			// accumulation without a background timer. Best-effort and detached so a
+			// slow reap never delays the open (issue #10022).
+			void reapOrphanSharedTargets(browser, scope);
+			// The reap skips this live process's own records, so it also retries
+			// the targets this process could not confirm closed earlier.
+			void retryUnclosedSharedTargets(browser, scope);
+		}
+		return handle;
 	} catch (err) {
 		if (err instanceof ToolAbortError || err instanceof ToolError) throw err;
 		if (opts.signal?.aborted) throw new ToolAbortError("Browser open aborted");
